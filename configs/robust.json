@@ -1,0 +1,16 @@
+{
+    "prefix": "robust_train_1_loss",
+    "nepoch": 50,
+    "batchsize": 128,
+    "lr": 0.01,
+    "momentum": 0.9,
+    "seed": 69,
+    "sigma": [0.25, 0.5, 1.0],
+    "adv": true,
+    "num_steps": 10,
+    "num_noise_vec": 1,
+    "no_grad_attack": true,
+    "epsilon": [0.5, 1.0, 2.0, 4.0],
+    "warmup": 1
+
+}
