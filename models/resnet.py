@@ -142,8 +142,9 @@ def resnet18(pretrained=False, **kwargs):
         pretrained (bool): If True, returns a model pre-trained on ImageNet
     """
     model = ResNet(BasicBlock, [2, 2, 2, 2], arch='resnet18', **kwargs)
-    normalize_layer = NormalizeLayer()
-    return torch.nn.Sequential(normalize_layer, model)
+    # normalize_layer = NormalizeLayer()
+    # return torch.nn.Sequential(normalize_layer, model)
+    return model
 
 def resnet34(pretrained=False, **kwargs):
     """Constructs a ResNet-34 model.
@@ -151,8 +152,9 @@ def resnet34(pretrained=False, **kwargs):
         pretrained (bool): If True, returns a model pre-trained on ImageNet
     """
     model = ResNet(BasicBlock, [3, 4, 6, 3], arch='resnet34', **kwargs)
-    normalize_layer = NormalizeLayer()
-    return torch.nn.Sequential(normalize_layer, model)
+    # normalize_layer = NormalizeLayer()
+    # return torch.nn.Sequential(normalize_layer, model)
+    return model
 
 def resnet50(pretrained=False, **kwargs):
     """Constructs a ResNet-50 model.
