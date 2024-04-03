@@ -114,6 +114,6 @@ def load(data_folder, batch_size=64):
     train_set = data_loader(x_train, y_train, transform)
     test_set = data_loader(x_test, y_test, transform)
     train_loader = DataLoader(
-        train_set, batch_size=batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False)
+        train_set, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=4)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4)
     return train_loader, test_loader
