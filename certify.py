@@ -14,6 +14,9 @@ import torch.nn as nn
 import torch.optim as optim
 import argparse
 import os
+import json
+import datetime
+from time import time
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -125,104 +128,64 @@ class Smooth(object):
         return proportion_confint(NA, N, alpha=2 * alpha, method="beta")[0]
 
 
-def get_args():
+def load_json(settings_path):
+    with open(settings_path) as data_file:
+        param = json.load(data_file)
+
+    return param
+
+
+def setup_parser():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='./config.json',
+                        help='Json file of settings.')
     parser.add_argument('--data_folder', type=str, default='./')
     parser.add_argument('--batchsize', type=int, default=1)
     parser.add_argument('--seed', type=int, default=69)
-
-    parser.add_argument('--sigma_train', type=list, default=[0.0, 1.0,
-                                                    2.0
-                                                    ])
-    parser.add_argument('--adv', type=str, default="Adv")
-
-    parser.add_argument('--sigma', type=int, default=4)
-    parser.add_argument('--N0', type=int, default=50)
-    parser.add_argument('--N', type=int, default=500)
+    parser.add_argument('--N0', type=int, default=100)
+    parser.add_argument('--N', type=int, default=10000)
     parser.add_argument('--alpha', type=int, default=0.001)
-    parser.add_argument('--outfile', type=str, default="certify/mixedloss.txt")
 
-    args = parser.parse_args()
-    return args
-
-
-def plot(data, args):
-    plt.figure()
-
-    for i, sigma in enumerate(args.sigma_train):
-        plt.plot(list(zip(*data[i]))[0], list(zip(*data[i]))[1], label=sigma)
-
-    for i, sigma in enumerate(args.sigma_train):
-        plt.plot(list(zip(*data[len(args.sigma_train) + i]))[0], list(zip(*data[len(args.sigma_train) + i]))[1], label=f"{sigma}_newloss")
-
-    plt.legend()
-    plt.xlabel('Sigma', fontsize=14)
-    plt.ylabel('Accuracy (%)', fontsize=14)
-    plt.title('Sigma and Certified Accuracy', fontsize=16)
-
-    plt.savefig(f"plot_certification.png")
+    return parser
 
 
 if __name__ == '__main__':
-    args = get_args()
-    torch.manual_seed(args.seed)
-    train_loader, test_loader = data_preprocess.load(args.data_folder, batch_size=args.batchsize)
+    args = setup_parser().parse_args()
+    param = load_json(args.config)
+    args = vars(args) 
+    args.update(param) 
 
-    data = []
-    for sigma_train in args.sigma_train:
-        # load_file = "logs/" + args.adv + f"/{sigma_train}/weight.pt"
-        load_file = "logs/" + args.adv + f"/{sigma_train}/weight.pt"
-        model = torch.load(load_file)
-        model.to(DEVICE)
+    torch.manual_seed(args['seed'])
+    train_loader, test_loader = data_preprocess.load("", batch_size=args['batchsize'])
 
-        sigma = 0
-        tmp = []
-        while sigma <= args.sigma:
-            correct, total = 0, 0
+    args['save_folder'] = "certify/" + f"{args['prefix']}/"
+    if not os.path.exists(args['save_folder']):
+        os.makedirs(args['save_folder'])
+
+    for sigma in args['sigma']:
+        for epsilon in args['epsilon']:
+            
+            log_file = args['save_folder'] + f"{sigma}/{epsilon}.txt"
+            f = open(log_file, 'w')
+            print("idx\tlabel\tpredict\tradius\tcorrect\ttime", file=f, flush=True)
+            
+            weight_file = "logs/" + f"{args['prefix']}/" + f"{sigma}/" + f"{epsilon}/weight.pt"
+            model = torch.load(weight_file)
+            model.to(DEVICE)
+
             smoothed_classifier = Smooth(model, 9, sigma)
 
-            for sample, target in test_loader:
+            for i, (sample, target) in enumerate(test_loader):
                 sample, target = sample.to(DEVICE).float(), target.to(DEVICE).long()
 
+                before_time = time()
                 prediction, radius = smoothed_classifier.certify(sample, args.N0, args.N, args.alpha, args.batchsize)
+                after_time = time()
 
-                if prediction == target and radius >= sigma:
-                    correct += (prediction == target)
-                total += target.size(0)
+                correct = int(prediction == target)
 
-            print(correct)
-            sigma += 0.5
-            tmp.append([sigma, float(correct) * 100 / total])
+                time_elapsed = str(datetime.timedelta(seconds=(after_time - before_time)))
+                print("{}\t{}\t{}\t{:.3}\t{}\t{}".format(
+                    i, target, prediction, radius, correct, time_elapsed), file=f, flush=True)
 
-        data.append(tmp)
-
-
-    for sigma_train in args.sigma_train:
-        # load_file = "logs/" + args.adv + f"/{sigma_train}/weight.pt"
-        load_file = "logs/" + "NewLoss" + f"/{sigma_train}/weight.pt"
-        model = torch.load(load_file)
-        model.to(DEVICE)
-
-        sigma = 0
-        tmp = []
-        while sigma <= args.sigma:
-            correct, total = 0, 0
-            smoothed_classifier = Smooth(model, 9, sigma)
-
-            for sample, target in test_loader:
-                sample, target = sample.to(DEVICE).float(), target.to(DEVICE).long()
-
-                prediction, radius = smoothed_classifier.certify(sample, args.N0, args.N, args.alpha, args.batchsize)
-
-                if prediction == target and radius >= sigma:
-                    correct += (prediction == target)
-                total += target.size(0)
-
-            print(correct)
-            sigma += 0.5
-            tmp.append([sigma, float(correct) * 100 / total])
-
-        data.append(tmp)
-    
-    plot(data, args)
-        
+    f.close()

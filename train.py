@@ -1,75 +1,25 @@
 from itertools import accumulate
-import data_preprocess
+import dataset.data_preprocess as data_preprocess
 import matplotlib.pyplot as plt
-import network as net
+import models.network
+import models.resnet
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import argparse
 import os
-from attack import Attacker, PGD_L2, DDN
+from attacks.attack import Attacker, PGD_L2, DDN
+import json
+from torch.optim.lr_scheduler import StepLR
+import logging, sys
 
 
 DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-
-
 def requires_grad_(model:torch.nn.Module, requires_grad:bool) -> None:
     for param in model.parameters():
         param.requires_grad_(requires_grad)
-
-
-def train(model, optimizer, train_loader, test_loader, args, sigma):
-    criterion = nn.CrossEntropyLoss()
-
-    # attacker = PGD_L2(steps=args.num_steps, device='cuda', max_norm=args.epsilon)
-    attacker = PGD_L2(steps=args.num_steps, device='cuda', max_norm=sigma)
-
-    result = []
-    for e in range(args.nepoch):
-        model.train()
-        correct, total_loss = 0, 0
-        total = 0
-        for sample, target in train_loader:
-            sample, target = sample.to(DEVICE).float(), target.to(DEVICE).long()
-            sample = sample.view(-1, 9, 1, 128)
-
-
-            noise = torch.randn_like(sample, device='cuda') * sigma
-
-            if args.adv == "Adv":
-                requires_grad_(model, False)
-                model.eval()
-                sample = attacker.attack(model, sample, target, 
-                                        noise=noise, 
-                                        num_noise_vectors=args.num_noise_vec, 
-                                        no_grad=args.no_grad_attack
-                                        )
-                model.train()
-                requires_grad_(model, True)
-
-            sample = sample + noise
-
-            output = model(sample)
-
-            loss = criterion(output, target)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            _, predicted = torch.max(output.data, 1)
-            total += target.size(0)
-            correct += (predicted == target).sum()
-        acc_train = float(correct) * 100.0 / len(train_loader.dataset)
-
-        # Testing
-        acc_test = valid(model, test_loader)
-        print(f'Epoch: [{e}/{args.nepoch}], loss:{total_loss / len(train_loader):.4f}, train_acc: {acc_train:.2f}, test_acc: {float(correct) * 100 / total:.2f}')
-        result.append([acc_train, acc_test])
-        # result_np = np.array(result, dtype=float)
-        # np.savetxt('logs/result_np.csv', result_np, fmt='%.2f', delimiter=',')
-    return result
 
 
 def valid(model, test_loader):
@@ -78,7 +28,6 @@ def valid(model, test_loader):
         correct, total = 0, 0
         for sample, target in test_loader:
             sample, target = sample.to(DEVICE).float(), target.to(DEVICE).long()
-            sample = sample.view(-1, 9, 1, 128)
 
             output = model(sample)
             _, predicted = torch.max(output.data, 1)
@@ -89,8 +38,7 @@ def valid(model, test_loader):
     return acc_test
 
 
-def plot(args):
-    data = np.loadtxt(args.save_folder + "result.csv", delimiter=',')
+def plot(data, args):
     plt.figure()
     plt.plot(range(1, len(data[:, 0]) + 1),
              data[:, 0], color='blue', label='train')
@@ -100,56 +48,130 @@ def plot(args):
     plt.xlabel('Epoch', fontsize=14)
     plt.ylabel('Accuracy (%)', fontsize=14)
     plt.title('Train and Test Accuracy', fontsize=16)
-    plt.savefig(args.save_folder + "train_plot.png")
+    plt.savefig(args['save_folder'] + "train_plot.png")
 
 
-def get_args():
+def _train(scheduler, model, optimizer, train_loader, test_loader, attacker, criterion, sigma, epsilon, args):
+    result = []
+    for e in range(args['nepoch']):
+        scheduler.step()
+
+        attacker.max_norm = np.min([epsilon, (e + 1) * epsilon/args['warmup']])
+        attacker.init_norm = np.min([epsilon, (e + 1) * epsilon/args['warmup']])
+
+        model.train()
+        correct, total_loss = 0, 0
+        total = 0
+        for sample, target in train_loader:
+            sample, target = sample.to(DEVICE).float(), target.to(DEVICE).long()
+
+            noise = torch.randn_like(sample, device='cuda') * sigma
+            
+            sample_w_noise = sample
+            if args['adv']:
+                requires_grad_(model, False)
+                model.eval()
+                sample_w_noise = attacker.attack(model, sample, target, 
+                                        noise=noise, 
+                                        num_noise_vectors=args['num_noise_vec'], 
+                                        no_grad=args['no_grad_attack']
+                                        )
+                model.train()
+                requires_grad_(model, True)
+            
+            if args['prefix'] != "clean_training":
+                sample_w_noise = sample_w_noise + noise
+                sample_w_noise = torch.clamp(sample_w_noise, min = 0, max = 1)
+            
+            output_w_noise = model(sample_w_noise)
+            loss = criterion(output_w_noise, target)
+
+            if args['mix']:
+                output = model(sample)
+                loss_wo_noise = criterion(output, target)
+                loss = loss + loss_wo_noise
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            _, predicted = torch.max(output_w_noise.data, 1)
+            total += target.size(0)
+            correct += (predicted == target).sum()
+        acc_train = float(correct) * 100.0 / len(train_loader.dataset)
+
+        # Testing
+        acc_test = valid(model, test_loader)
+        logging.info(f"Epoch: [{e}/{args['nepoch']}], LR: {scheduler.get_last_lr()[0]}, "
+              f"loss:{total_loss / len(train_loader):.4f}, train_acc: {acc_train:.2f}, "
+              f"test_acc: {acc_test:.2f}")
+        result.append([acc_train, acc_test])
+        # result_np = np.array(result, dtype=float)
+        # np.savetxt('logs/result_np.csv', result_np, fmt='%.2f', delimiter=',')
+    return result
+
+
+def train(args):
+    train_loader, test_loader = data_preprocess.load("", batch_size=args['batchsize'])
+    
+    for sigma in args['sigma']:
+        for epsilon in args['epsilon']:
+
+            args['save_folder'] = "logs/" + f"{args['prefix']}/" + f"{sigma}/" + f"{epsilon}/" 
+            if not os.path.exists(args['save_folder']):
+                os.makedirs(args['save_folder'])
+
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s => %(message)s',
+                handlers=[
+                    logging.FileHandler(filename=args['save_folder'] + 'info.log'),
+                    logging.StreamHandler(sys.stdout)
+                ]
+            )
+
+            logging.info(f"Sigma: {sigma} / Epsilon: {epsilon}")
+
+            torch.manual_seed(args['seed'])
+
+            model = models.resnet.resnet18(num_classes=6).to(DEVICE)
+            # model = models.network.Network().to(DEVICE)
+            optimizer = optim.SGD(params=model.parameters(), lr=args['lr'], momentum=args['momentum'])
+            attacker = PGD_L2(steps=args['num_steps'], device='cuda', max_norm=epsilon)
+            criterion = nn.CrossEntropyLoss()
+            scheduler = StepLR(optimizer, step_size=args['lr_step_size'])
+
+            result = _train(scheduler, model, optimizer, train_loader, test_loader, attacker, criterion, sigma, epsilon, args)
+            torch.save(model, args['save_folder'] + "weight.pt")
+
+            result = np.array(result, dtype=float)
+            # np.savetxt(args['save_folder'] + "result.csv", result, fmt='%.2f', delimiter=',')
+            plot(result, args)
+
+
+def main():
+    args = setup_parser().parse_args()
+    param = load_json(args.config)
+    args = vars(args) 
+    args.update(param) 
+
+    train(args)
+
+
+def load_json(settings_path):
+    with open(settings_path) as data_file:
+        param = json.load(data_file)
+
+    return param
+
+
+def setup_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--nepoch', type=int, default=50)
-    parser.add_argument('--batchsize', type=int, default=128)
-    parser.add_argument('--lr', type=float, default=.01)
-    parser.add_argument('--momentum', type=float, default=.9)
-    parser.add_argument('--data_folder', type=str, default='./')
-    parser.add_argument('--seed', type=int, default=69)
+    parser.add_argument('--config', type=str, default='./config.json',
+                        help='Json file of settings.')
 
-
-    parser.add_argument('--sigma', type=list, default=[0.0, 0.1, 0.2, 0.3, 0.4, 
-                                                       0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
-                                                       1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 
-                                                       1.7, 1.8, 1.9, 2.0
-                                                       ])
-    parser.add_argument('--adv', type=str, default="Adv")
-
-
-    parser.add_argument('--num_steps', type=int, default=10)
-    parser.add_argument('--num-noise-vec', default=1, type=int,
-                    help="number of noise vectors to use for finding adversarial examples. `m_train` in the paper.")
-    parser.add_argument('--no-grad-attack', action='store_true',
-                    help="Choice of whether to use gradients during attack or do the cheap trick")
-
-    args = parser.parse_args()
-    return args
+    return parser
 
 
 if __name__ == '__main__':
-    args = get_args()
-    for sigma in args.sigma:
-        args.save_folder = "logs/" + args.adv + f"/{sigma}/"
-
-        torch.manual_seed(args.seed)
-        if not os.path.exists(args.save_folder):
-            os.makedirs(args.save_folder)
-
-        train_loader, test_loader = data_preprocess.load(
-            args.data_folder, batch_size=args.batchsize)
-        
-        model = net.Network().to(DEVICE)
-
-        optimizer = optim.SGD(params=model.parameters(), lr=args.lr, momentum=args.momentum)
-
-        result = train(model, optimizer, train_loader, test_loader, args, sigma)
-        torch.save(model, args.save_folder + "weight.pt")
-
-        result = np.array(result, dtype=float)
-        np.savetxt(args.save_folder + "result.csv", result, fmt='%.2f', delimiter=',')
-        plot(args)
+    main()
